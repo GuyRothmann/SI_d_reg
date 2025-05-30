@@ -1,0 +1,338 @@
+% -------------------------------------------------------------------------
+% The SI model on d-regular N-body hypernetworks
+% -------------------------------------------------------------------------
+% This script generates random d‑regular N‑uniform hypergraphs using the
+% configuration model, simulates the Susceptible–Infected (SI) dynamics on
+% them with the Gillespie algorithm, and plots the averaged numerical
+% solution and the exact analytical solution.
+% -------------------------------------------------------------------------
+% Author: Guy Rothmann, Tel Aviv University
+% -------------------------------------------------------------------------
+
+clearvars; close all; clc;
+
+%% --------------------------- 1. Parameters --------------------------------
+M                       = 1e4;          % #nodes
+d                       = 3;            % hyperdegree (each node appears in d hyperedges)
+N                       = 3;            % hyperedge size (N=2 ⇒ ordinary network)
+I0                      = 0.25;         % initial infection level
+t_final                 = 10;           % final time
+num_time_steps          = 1e3;          % temporal resolution (we discretize the time interval)
+num_hypergraphs         = 10;           % #independent hypergraph realisations
+num_SI_realisations     = 10;           % #SI runs per hypergraph
+q                       = d;            % hyperedge weight (this is the infection rate of each hyperedge)
+
+%% ----------------------- 2. Derived quantities -----------------------------
+dt          = t_final / num_time_steps;
+t_grid      = linspace(0, t_final, num_time_steps+1);
+
+%% ----------------------- 3. Run batch simulations --------------------------
+I_numerical = 0; 
+for hypergraph_num = 1:num_hypergraphs % use "for" if you don't have parallel toolbox
+    disp(strcat("Generating Hypergraph: ",num2str(hypergraph_num),"/",num2str(num_hypergraphs)));
+    % Generate hypergraph (using configuration model)
+    deg_sequence = d * ones(M,1);
+    [hyperedge_list, rem_self, rem_rep] = canonical_hypergraph_configuration_model(deg_sequence, N);
+    disp("Simulating the SI model...")
+    I_numerical_single_hypergraph = 0;
+    if N == 2
+            E = sparse(hyperedge_list(:,1), hyperedge_list(:,2), 1, M, M);
+            E = E + E.'; 
+    end
+    parfor SI_realization_number = 1:num_SI_realisations
+        if N == 2 % On networks we can use matrix multiplication, this is faster
+               T = Simulation_Gillespie_Algorithm_networks(q/d, E, I0);
+            tic
+        else
+            T = Simulation_Gillespie_Algorithm_hypernetworks(q/d, hyperedge_list, I0,M);
+            tic
+        end
+        I_numerical_single_hypergraph = I_numerical_single_hypergraph + Discretisize_f_Gillespie(T, num_time_steps, dt, M, I0)/num_SI_realisations;
+    end
+    I_numerical = I_numerical + I_numerical_single_hypergraph / num_hypergraphs;
+    elapsed_time = toc;
+    fprintf('Total simulation time = %.2f seconds\n', elapsed_time);
+    disp("-----------------------")
+end
+disp("Finished simulations")
+
+%% ----------------------- 4. Plot results --------------------------
+options = odeset('RelTol',1e-8,'AbsTol',1e-7);
+figure;
+box on
+hold on
+plot(t_grid,I_numerical,':','Color','red','LineWidth',2);
+F_CM_N_body = @(t,u) q/d.*(1 - u - (1-(1-I0)*u.^(d-1)).^(N-1)      );
+odefun = @(t, u) F_CM_N_body(t,u);
+[t_grid_ODE, u_grid] = ode45(odefun, [0,t_final], 1,options);
+f_analytical = 1-(1-I0).*u_grid.^d;
+plot(t_grid_ODE,f_analytical,'--','Color','blue','LineWidth',2);
+xlabel("$t$",'Interpreter','latex','FontSize',35);
+ylabel("$[I]$",'Rotation',0,'Interpreter','latex','FontSize',35)
+xticks([0,t_final]);yticks([0,1])
+legend("Numerical","Analytical",'Location','southeast','FontSize',25)
+%%
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function T = Simulation_Gillespie_Algorithm_hypernetworks(q_k_to_j, hyperedges_list, I0, M)
+% Simulates infection times using the Gillespie Algorithm
+% Inputs:
+%   q_k_to_j           - Effective "infection" rate: This is q/d.
+%   hyperedges_list - (#hyperedges x N) matrix; each row is a hyperedge 
+%   I0              - Initial fraction of adopters (0 <= I0 <= 1)
+%   M               - Number of nodes
+% Output:
+%   T               - (M x 1) vector, T(j) = infection time of individual j
+
+    %% Basic setup
+    N = size(hyperedges_list, 2);     % size of each hyperedge
+    numHyperedges = size(hyperedges_list, 1);
+
+    % Output infection times
+    T = inf(M, 1);             
+    T_current = 0;                     
+
+    % Boolean state: true = susceptible, false = infected
+    S_state = true(M, 1);  
+
+    % Initially infect a fraction I0 of individuals
+    num_infected = round(I0 * M);
+    infected_indices = randperm(M, num_infected);
+    S_state(infected_indices) = false; 
+    T(infected_indices) = 0;           % infected at time 0
+
+    % Set of susceptible nodes (S)
+    S = find(S_state); 
+
+    %% Precompute "node2hyperedges"
+    % node2hyperedges{k} = list of all hyperedges that contain node k
+    node2hyperedges = cell(M, 1);
+    for hyperedge_index = 1 : numHyperedges
+        nodes_in_e = hyperedges_list(hyperedge_index, :);
+        for node = nodes_in_e
+            node2hyperedges{node}(end+1) = hyperedge_index; 
+        end
+    end
+
+    %% Track how many adopters are in each hyperedge
+    % count_infected_in_hyperedge(e) = number of adopted nodes in hyperedge e
+    count_infected_in_hyperedge = zeros(numHyperedges, 1);
+    for hyperedge_index = 1 : numHyperedges
+        nodes_in_e = hyperedges_list(hyperedge_index, :);
+        % sum of "not S_state" among those nodes
+        count_infected_in_hyperedge(hyperedge_index) = sum(~S_state(nodes_in_e));
+    end
+
+    %% Track how many hyperedges are "N-1 infected" for each node
+    % num_infected_hypedges(node) = #hyperedges for which node is the *only* non-adopter
+    num_infected_hypedges = zeros(M, 1);
+
+    for hyperedge_index = 1 : numHyperedges
+        if count_infected_in_hyperedge(hyperedge_index) == (N - 1)
+            % Exactly 1 susceptible node in this hyperedge
+            nodes_in_e = hyperedges_list(hyperedge_index, :);
+            sidx = nodes_in_e(S_state(nodes_in_e)); % the one still susceptible
+            % If there's exactly one, increment that node's counter
+            if isscalar(sidx) %checks whether sidx is a single number (i.e., scalar) — meaning it contains exactly one susceptible node
+                num_infected_hypedges(sidx) = num_infected_hypedges(sidx) + 1;
+            end
+        end
+    end
+
+    %% Prepare array for sampled times (tau)
+    tau = inf(M,1);
+
+    %% Main loop: pick next adopter until all are adopted or no hazard
+    for step = 1 : M  % at most M events
+        if isempty(S), break; end
+
+        % Compute infection rates for the current set of susceptibles
+        lambda_values = q_k_to_j * num_infected_hypedges(S);
+
+        % If all infection rates are zero, we cannot infect further
+        if all(lambda_values == 0)
+            break;
+        end
+
+        % Sample next infection times from an exponential distribution:
+        %   tau_j = -log(rand) / lambda_j
+        % But do so only for the susceptibles in S:
+        tau(S) = -log(rand(numel(S), 1)) ./ lambda_values;  
+
+        % Find node with minimal tau among S
+        [tau_min, idx_min] = min(tau(S));
+        k_m = S(idx_min);  % the actual node index in {1,...,M}
+
+        % Update clock and record infection time
+        T_current = T_current + tau_min;
+        T(k_m) = T_current;
+
+        % Move k_m from susceptible to adopted
+        S_state(k_m) = false;
+        S(idx_min)    = [];   % remove from set of susceptibles
+
+        % ---- Update counters for hyperedges that contain k_m ----
+        % Because k_m is newly adopted, we increment the count in each hyperedge that k_m belongs to
+        affected_hyperedges = node2hyperedges{k_m};
+
+        for hyperedge_index = affected_hyperedges
+            oldCount = count_infected_in_hyperedge(hyperedge_index);
+            newCount = oldCount + 1;
+            count_infected_in_hyperedge(hyperedge_index) = newCount;
+
+            % If we just went from N-2 => N-1, then there's exactly 1 susceptible left in e
+            if oldCount == (N - 2) && newCount == (N - 1)
+                nodes_in_e = hyperedges_list(hyperedge_index, :);
+                sidx = nodes_in_e(S_state(nodes_in_e)); % the one still susceptible
+                if isscalar(sidx)
+                    % Now that hyperedge has exactly N-1 adopters,
+                    % increment that node's "num_infected_hypedges"
+                    num_infected_hypedges(sidx) = num_infected_hypedges(sidx) + 1;
+                end
+            end
+        end
+
+    end
+end
+
+
+function T = Simulation_Gillespie_Algorithm_networks(q, E,I0)
+% Simulates infection times in the SI model using the Gillespie algorithm.
+%
+% Inputs:
+%   q - edge weights
+%   E - An M x M adjacency matrix of the network 
+%
+% Output:
+%   T - A column vector of length M, where T(j) is the infection time of individual j.
+    M = size(E, 1);
+    % Initialize susceptibles (S) and adopters (I)
+    S = 1:M;           % Set of susceptibles
+    T = inf(M, 1);   % Adoption times for each individual
+    T_current = 0;     % Current time
+    S_state = true(M, 1);  % State of each individual (1 if nonadopter, 0 if adopter)
+    % Preallocate tau vector for efficiency
+    tau = inf(M, 1);   % Initialize infection times as infinity
+    num_infected = round(I0 * M);  % Calculate the number of infected nodes
+    % Randomly select 'num_infected' unique indices
+    infected_indices = randperm(M, num_infected);
+    S(infected_indices) = [];
+    T(infected_indices) = 0;
+    S_state(infected_indices) = 0;
+    % Loop over all individuals until everyone adopts
+    for m = 1:M
+        % Calculate the lambda (rate of infection) for all susceptibles
+        lambda =  q * (E(S, :) * (1 - S_state));  % Influence term using q as a scalar
+        % Sample infection times (tau_j^m) for all susceptibles from exponential distributions
+        tau(S) = -log(rand(length(S), 1)) ./ lambda;  
+        % Find the next adopter (k_m) with the minimal infection time
+        [tau_min, idx_min] = min(tau(S));
+        k_m = S(idx_min);
+        % Update current time and record infection time for k_m
+        T_current = T_current + tau_min;
+        T(k_m) = T_current;
+        % Remove k_m from susceptibles and add to adopters
+        S(idx_min) = [];
+        S_state(k_m) = false;
+        % Break if all individuals are infected
+        if or(isempty(S),max(lambda)==0)
+            break;
+        end
+    end
+end
+
+
+function [H, removed_self_dups, removed_repeats] = canonical_hypergraph_configuration_model(d, N)
+% CANONICAL_HYPERGRAPH_CONFIG Generate hyperedges using the canonical stub-list approach.
+%    H = each row is one hyperedge of size N (sorted, so [2,5,7] = [7,5,2]).
+%    removed_self_dups = number of edges removed for having repeated nodes.
+%    removed_repeats   = number of edges removed because they duplicated
+%                        an already-existing edge.
+%
+% INPUTS:
+%    d : Mx1 vector of integer degrees
+%    N : size of each hyperedge
+%
+% EXAMPLE:
+%    d = [3;3;3;3;3;3];  % 6 nodes, each with degree 3
+%    [H, rem_dup, rem_rep] = canonical_hypergraph_config(d, 3)
+
+    % Basic checks
+    M = length(d);
+    total_stubs = sum(d);
+    if mod(total_stubs, N) ~= 0
+        error('Sum of degrees must be divisible by N.');
+    end
+
+    % 1) Build the global stub list
+    stub_list = [];
+    for i = 1:M
+        % Append node i exactly d(i) times
+        stub_list = [stub_list, repmat(i, 1, d(i))];
+    end
+    
+    % 2) Shuffle the stub list
+    stub_list = stub_list(randperm(length(stub_list)));
+    
+    % 3) Partition into groups of size N
+    num_hyperedges = total_stubs / N;
+    rawH = reshape(stub_list, N, num_hyperedges)';  % Each row = 1 hyperedge (unsorted)
+
+    % ----------------------------------------------------------
+    % (A) Remove edges that contain a repeated node internally
+    % ----------------------------------------------------------
+    % has_duplicates(i) = true if the i-th hyperedge in rawH
+    % has fewer unique nodes than N (meaning some node is repeated).
+    has_duplicates = false(num_hyperedges, 1);
+    for e = 1:num_hyperedges
+        this_edge = rawH(e,:);
+        if length(unique(this_edge)) < N
+            has_duplicates(e) = true;
+        end
+    end
+    
+    removed_self_dups = sum(has_duplicates);
+    keep_mask = ~has_duplicates;            % keep edges that do NOT have repeated nodes
+    H_temp = rawH(keep_mask, :);           % intermediate set of "clean" edges
+
+    % ---------------------------------------
+    % (B) Remove repeated edges among the rest
+    % ---------------------------------------
+    % We interpret each hyperedge as an unordered set, so we sort the nodes
+    % in each hyperedge row. Then use 'unique' with 'stable' to keep
+    % the first occurrence and remove subsequent duplicates.
+    H_temp_sorted = sort(H_temp, 2);             % sort each row in ascending order
+    [H_unique_sorted, ~, ~] = unique(H_temp_sorted, 'rows', 'stable');
+    removed_repeats = size(H_temp,1) - size(H_unique_sorted,1);
+    % The final set of edges is the unique, sorted set
+    H = H_unique_sorted;
+end
+
+
+
+
+function [I_grid_Gillespie] = Discretisize_f_Gillespie(T,N_steps,dt,M,I0)
+    I_grid_Gillespie= zeros(1,N_steps+1);
+    for i=2:N_steps+1
+        t = double(i)*dt;
+        I_grid_Gillespie(i) = sum(T<t);
+    end
+    I_grid_Gillespie = I_grid_Gillespie / M;
+    I_grid_Gillespie(1)  = I0;
+end
